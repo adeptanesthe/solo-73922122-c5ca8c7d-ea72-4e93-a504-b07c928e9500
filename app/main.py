@@ -94,13 +94,13 @@ def _load_session(png_blobs: list[bytes], boxes_payload) -> dict:
             if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
                 raise HTTPException(400, f"第 {i} 帧必留框 {b} 超出画面或非法")
 
-    energies = [solver.window_energies(g) for g in grays]
+    # 上传只做 PNG 解码与必留框校验；灰度差评分推迟到求解时按可达范围进行。
     feasibles = [solver.feasible_mask(b, W, H) for b in frames_boxes]
     X = W - cw + 1
     session = {
         "n": len(grays), "w": W, "h": H, "cw": cw, "x_max": X - 1,
-        "png": png_blobs, "boxes": frames_boxes,
-        "energies": energies, "feasibles": feasibles,
+        "png": png_blobs, "grays": grays, "boxes": frames_boxes,
+        "feasibles": feasibles,
     }
     SESSION.clear()
     SESSION.update(session)
@@ -164,11 +164,34 @@ async def api_solve(req: SolveRequest):
         if not 0 <= i < SESSION["n"]:
             raise HTTPException(400, f"锁定帧号越界：{i}")
         locks[i] = int(v)
-    traj, fail, total = solver.solve(SESSION["energies"], SESSION["feasibles"], locks)
-    if traj is None:
-        return {"ok": False, "fail_frame": fail,
-                "message": f"从首帧起第 {fail} 帧无法接续，完整轨迹接不出来"}
-    return {"ok": True, "trajectory": traj, "energy": total}
+
+    result = solver.plan(SESSION["grays"], SESSION["feasibles"], locks)
+    # 可达窗在横坐标上连续，前端只需区间即可渲染取景范围。
+    reach = None
+    if result["reachable"] is not None:
+        reach = []
+        for m in result["reachable"]:
+            idx = np.flatnonzero(m)
+            reach.append([int(idx[0]), int(idx[-1]), int(idx.size)] if idx.size else None)
+
+    if not result["ok"]:
+        return {
+            "ok": False, "fail_frame": result["fail_frame"],
+            "message": (f"从首帧起第 {result['fail_frame']} 帧无法接续，"
+                        "完整轨迹接不出来；本轮不计算灰度差"),
+            "pair_count": 0, "full_pair_count": result["full_pair_count"],
+            "reachable": None,
+        }
+    return {
+        "ok": True,
+        "trajectory": result["trajectory"],
+        "energy": result["total_energy"],
+        "reachable": reach,
+        "pair_count": result["pair_count"],
+        "h_pairs": result["h_pairs"],
+        "v_pairs": result["v_pairs"],
+        "full_pair_count": result["full_pair_count"],
+    }
 
 
 @app.get("/api/frame/{idx}.png")

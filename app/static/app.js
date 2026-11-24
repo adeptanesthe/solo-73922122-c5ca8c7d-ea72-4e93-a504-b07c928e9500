@@ -5,6 +5,7 @@ const $ = (id) => document.getElementById(id);
 let meta = null;        // {n,w,h,cw,x_max,boxes,feasible}
 let images = [];        // 每帧 Image
 let trajectory = null;  // 求解成功后的逐帧 x
+let reachable = null;   // 每帧可达取景区间 [[lo,hi,count], ...]，失败时为 null
 let locks = {};         // 帧号 -> 锁定 x
 let cur = 0;
 let shownX = 0;         // 当前帧画面上显示的裁切窗横坐标
@@ -69,6 +70,7 @@ async function afterLoad(m) {
   meta = m;
   locks = {};
   trajectory = null;
+  reachable = null;
   failFrame = null;
   cur = 0;
   shownX = 0;
@@ -79,7 +81,6 @@ async function afterLoad(m) {
   $("cvMain").width = m.w; $("cvMain").height = m.h;
   $("cvPreview").width = m.cw; $("cvPreview").height = m.h;
   $("viewer").hidden = false;
-  $("btnSolve").disabled = false;
   setStatus(`已载入 ${m.n} 帧（${m.w}×${m.h}，裁切窗 ${m.cw}×${m.h}，x ∈ [0, ${m.x_max}]），求解中…`);
   await solve();
 }
@@ -101,16 +102,24 @@ async function solve() {
     const r = await postJSON("/api/solve", { locks });
     if (r.ok) {
       trajectory = r.trajectory;
+      reachable = r.reachable;
       failFrame = null;
       shownX = trajectory[cur];
-      setStatus(`求解成功，总能量 ${Math.round(r.energy).toLocaleString()}。可拖动裁切窗并锁定。`, "ok");
+      const saved = (1 - r.pair_count / r.full_pair_count) * 100;
+      setStatus(
+        `求解成功，总能量 ${Math.round(r.energy).toLocaleString()}。`
+        + `本轮计算灰度差像素对 ${r.pair_count.toLocaleString()}`
+        + `（横 ${r.h_pairs.toLocaleString()} / 竖 ${r.v_pairs.toLocaleString()}），`
+        + `全量评分需 ${r.full_pair_count.toLocaleString()}，按可达范围少算 ${saved.toFixed(1)}%。`
+        + "可拖动裁切窗并锁定，改锁后按新的可达范围重新评分。", "ok");
     } else {
       trajectory = null;
+      reachable = null;
       failFrame = r.fail_frame;
       cur = failFrame;
       $("slider").value = cur;
       shownX = defaultX(cur);
-      setStatus(r.message + "——已撤下竖屏预览，可调整锁定后重新求解。", "err");
+      setStatus(r.message + "——已撤下竖屏预览并跳到该帧，可调整锁定后重新求解。", "err");
     }
   } catch (e) {
     setStatus("求解失败：" + e.message, "err");
@@ -126,6 +135,15 @@ function render() {
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(images[cur], 0, 0);
 
+  const failed = trajectory === null;
+
+  // 可达取景范围（浅蓝带）：只覆盖能出现在某条完整合法轨迹上的窗口位置。
+  if (!failed && reachable && reachable[cur]) {
+    const [lo, hi] = reachable[cur];
+    ctx.fillStyle = "rgba(40,120,255,0.18)";
+    ctx.fillRect(lo, 0, (hi + meta.cw) - lo, meta.h);
+  }
+
   // 必留框（红）
   ctx.lineWidth = 1;
   ctx.strokeStyle = "#e33";
@@ -133,7 +151,6 @@ function render() {
     ctx.strokeRect(b[0] + 0.5, b[1] + 0.5, b[2] - b[0] - 1, b[3] - b[1] - 1);
   }
 
-  const failed = trajectory === null;
   $("previewPane").style.visibility = failed ? "hidden" : "visible";
 
   // 裁切窗（锁定绿 / 未锁定蓝；失败时也可拖动以便重新锁定）
@@ -156,7 +173,10 @@ function render() {
     ctx.fillText("第 " + cur + " 帧起无法接续", 8, 18);
   }
 
-  $("frameLabel").textContent = `第 ${cur + 1}/${meta.n} 帧`;
+  const reachTxt = (!failed && reachable && reachable[cur])
+    ? `，可达窗 ${reachable[cur][2]} 个（x∈[${reachable[cur][0]}, ${reachable[cur][1]}]）`
+    : "";
+  $("frameLabel").textContent = `第 ${cur + 1}/${meta.n} 帧${reachTxt}`;
   $("btnLock").textContent = locks[cur] !== undefined ? "更新锁定为当前位置" : "锁定本帧位置";
   renderLocks();
 }

@@ -7,8 +7,14 @@
 - 二阶约束：|(x_{i+1} - x_i) - (x_i - x_{i-1})| <= 2。
 - 目标：最大化 sum_i energy_i(x_i)，energy 为窗口内横竖相邻像素灰度差绝对值之和。
 
-用二阶动态规划求解：状态 (x_{i-1}, x_i)，向量化转移。
-若无可行轨迹，返回从首帧起最早接不上的帧下标。
+评分流程（本版）：
+1. 只用可行掩码与锁定，做布尔可达性 DP，判断整段能否接成一条完整合法轨迹，
+   并求出每帧“能出现在某条完整合法轨迹上”的窗口集合（可达窗）。
+2. 无解：返回从首帧起最早接不上的帧下标，不触碰灰度数据、不计算任何灰度差。
+3. 有解：只给可达窗评分。某个水平/竖直相邻像素对，只有同时落在某个可达窗内
+   才计算一次灰度差（同一轮、同一帧每对像素最多算一次），再用前缀和把
+   列差聚合成各窗能量；不可达窗能量置 0，不参与选择。
+4. 二阶数值动态规划在评分后的能量上求全局最优（同分选法与旧版完全一致）。
 """
 
 from __future__ import annotations
@@ -27,10 +33,12 @@ def crop_width(height: int) -> int:
 
 
 def window_energies(gray: np.ndarray) -> np.ndarray:
-    """计算每个窗口横坐标 x 的能量。
+    """计算每个窗口横坐标 x 的能量（全量评分，不考虑可达性）。
 
     gray: (H, W) 灰度数组。返回长度 X = W - cw + 1 的 float64 数组，
     energy[x] = 窗口 [0:H, x:x+cw] 内水平相邻与竖直相邻像素灰度差绝对值之和。
+
+    保留用于对照测试与旧 API；plan() 走按可达范围评分的新路径。
     """
     g = gray.astype(np.float32)
     H, W = g.shape
@@ -76,6 +84,141 @@ def feasible_mask(boxes: list, width: int, height: int) -> np.ndarray:
     return mask
 
 
+# ------------------------------------------------------------ 可达性
+
+def _merge_locks(feasibles: list[np.ndarray], locks: dict[int, int] | None):
+    """把锁定合并进可行掩码，返回新的掩码列表与横坐标数 X。"""
+    X = feasibles[0].shape[0]
+    locks = locks or {}
+    F = [f.copy() for f in feasibles]
+    for i, x in locks.items():
+        m = np.zeros(X, dtype=bool)
+        if 0 <= int(x) < X:
+            m[int(x)] = True
+        F[i] &= m
+    return F, X
+
+
+def reachable_masks(feasibles: list[np.ndarray],
+                    locks: dict[int, int] | None = None):
+    """布尔可达性 DP：每帧哪些窗口横坐标能出现在一条完整合法轨迹上。
+
+    与数值 DP 同构但只记录“可达/不可达”，全程不使用灰度数据。
+
+    返回 (masks, fail_frame)：
+    - 成功：masks 为每帧长度 X 的 bool 数组（True = 该 x 在某条完整合法轨迹上），
+      fail_frame 为 None；
+    - 失败：masks 为 None，fail_frame 为从首帧起最早接不上的帧下标。
+    """
+    N = len(feasibles)
+    F, X = _merge_locks(feasibles, locks)
+
+    if not F[0].any():
+        return None, 0
+    if N == 1:
+        return [F[0].copy()], None
+
+    B, C = np.indices((X, X))
+    pair_ok = np.abs(B - C) <= MAX_SHIFT
+
+    # 正向：fwd[i] 对应相邻对 P_i = (x_i, x_{i+1})，i = 0..N-2，
+    # 表示该对能否由首帧沿约束到达。
+    fwd: list[np.ndarray | None] = [None] * (N - 1)
+    fwd[0] = pair_ok & F[0][B] & F[1][C]
+    if not fwd[0].any():
+        return None, 1
+    for i in range(1, N - 1):
+        nxt = np.zeros((X, X), dtype=bool)
+        # P_{i-1} = (a, b) -> P_i = (b, c)，a = 2b - c + k
+        for k in range(-MAX_ACCEL, MAX_ACCEL + 1):
+            A = 2 * B - C + k
+            valid = (A >= 0) & (A < X)
+            Ac = np.clip(A, 0, X - 1)
+            nxt |= np.where(valid, fwd[i - 1][Ac, B], False)
+        nxt &= pair_ok & F[i + 1][C]
+        if not nxt.any():
+            return None, i + 1
+        fwd[i] = nxt
+
+    # 反向：back[i] 表示 P_i 能否沿约束走到末帧。
+    back: list[np.ndarray | None] = [None] * (N - 1)
+    back[N - 2] = pair_ok & F[N - 2][B] & F[N - 1][C]
+    for i in range(N - 3, -1, -1):
+        nxt = np.zeros((X, X), dtype=bool)
+        # P_i = (a, b) -> P_{i+1} = (b, c)，c = 2b - a + k
+        for k in range(-MAX_ACCEL, MAX_ACCEL + 1):
+            Cc = 2 * C - B + k
+            valid = (Cc >= 0) & (Cc < X)
+            Ccc = np.clip(Cc, 0, X - 1)
+            nxt |= np.where(valid, back[i + 1][C, Ccc], False)
+        nxt &= pair_ok & F[i][B]
+        back[i] = nxt
+
+    # 同时在“首帧可达”与“可走到末帧”的对上出现的横坐标，即完整轨迹上的窗。
+    masks = [np.zeros(X, dtype=bool) for _ in range(N)]
+    masks[0] = (fwd[0] & back[0]).any(axis=1)
+    for j in range(1, N - 1):
+        masks[j] = (fwd[j - 1] & back[j - 1]).any(axis=0)
+    masks[N - 1] = (fwd[N - 2] & back[N - 2]).any(axis=0)
+    return masks, None
+
+
+# ------------------------------------------------------------ 按可达范围评分
+
+def scored_window_energies(gray: np.ndarray, reachable: np.ndarray):
+    """只给可达窗评分，返回 (energies, h_pairs, v_pairs)。
+
+    - 水平相邻像素对 (y, j)-(y, j+1)：仅当某可达窗同时含两列 j、j+1 时才算，
+      即 j 落在可达窗并集 ⋃[x, x+cw-2] 内；
+    - 竖直相邻像素对 (y, j)-(y+1, j)：仅当列 j 落在并集 ⋃[x, x+cw-1] 内时才算。
+    - 同一轮、同一帧每对像素只计算一次，列差经前缀和复用给各窗。
+
+    energies 长度 X，不可达窗置 0.0；可达窗的数值与全量评分完全一致。
+    h_pairs/v_pairs 为本帧实际计算灰度差的水平/竖直相邻像素对数量。
+    """
+    g = gray.astype(np.float32)
+    H, W = g.shape
+    cw = crop_width(H)
+    X = W - cw + 1
+    reach = np.asarray(reachable, dtype=bool).reshape(-1)
+
+    # 差分标记可达窗覆盖到的列（并集），避免对每列重复判定。
+    h_mark = np.zeros(W, dtype=np.int32)       # 水平差列 0..W-2
+    v_mark = np.zeros(W + 1, dtype=np.int32)   # 竖直差列 0..W-1
+    for x in np.flatnonzero(reach):
+        h_mark[int(x)] += 1
+        h_mark[int(x) + cw - 1] -= 1           # 覆盖 x .. x+cw-2
+        v_mark[int(x)] += 1
+        v_mark[int(x) + cw] -= 1               # 覆盖 x .. x+cw-1
+    h_elig = np.cumsum(h_mark)[:W - 1] > 0
+    v_elig = np.cumsum(v_mark)[:W] > 0
+
+    h_cols = np.flatnonzero(h_elig)
+    v_cols = np.flatnonzero(v_elig)
+    h_pairs = int(h_cols.size) * H
+    v_pairs = int(v_cols.size) * (H - 1)
+
+    # 只对合格列计算灰度差（每对像素在本帧本轮只出现一次）。
+    hd = np.zeros(W - 1, dtype=np.float32)
+    if h_cols.size:
+        hd[h_cols] = np.abs(g[:, h_cols + 1] - g[:, h_cols]).sum(axis=0)
+    vd = np.zeros(W, dtype=np.float32)
+    if v_cols.size:
+        vd[v_cols] = np.abs(g[1:, v_cols] - g[:-1, v_cols]).sum(axis=0)
+
+    # 前缀和把列差聚合成窗口能量：窗 x 的水平差列 x..x+cw-2、竖直差列 x..x+cw-1。
+    ch = np.concatenate(([0.0], np.cumsum(hd, dtype=np.float64)))
+    hsum = ch[cw - 1:cw - 1 + X] - ch[0:X]
+    cv = np.concatenate(([0.0], np.cumsum(vd, dtype=np.float64)))
+    vsum = cv[cw:cw + X] - cv[0:X]
+
+    energies = hsum + vsum
+    energies[~reach] = 0.0
+    return energies, h_pairs, v_pairs
+
+
+# ------------------------------------------------------------ 数值 DP（保留）
+
 def solve(energies: list[np.ndarray],
           feasibles: list[np.ndarray],
           locks: dict[int, int] | None = None):
@@ -101,7 +244,7 @@ def solve(energies: list[np.ndarray],
             m[int(x)] = True
         F[i] &= m
 
-    # E[i][x]：不可行位置能量置为 NEG
+    # E[i][x]：不可行位置能量置 NEG
     E = [np.where(F[i], energies[i].astype(np.float64), NEG) for i in range(N)]
 
     if not F[0].any():
@@ -151,3 +294,59 @@ def solve(energies: list[np.ndarray],
         b_, c_ = traj[i - 1], traj[i]
         traj[i - 2] = int(parents[i][b_, c_])
     return traj, None, total
+
+
+# ------------------------------------------------------------ 整轮编排
+
+def full_pair_count(height: int, width: int, n_frames: int) -> int:
+    """旧全量评分一轮会计算的相邻像素对总数（对照基准）。"""
+    return n_frames * (height * (width - 1) + (height - 1) * width)
+
+
+def plan(grays: list[np.ndarray],
+         feasibles: list[np.ndarray],
+         locks: dict[int, int] | None = None) -> dict:
+    """一轮求解的完整编排：先判可行、再按可达范围评分、最后数值 DP。
+
+    返回 dict：
+    - 成功：{ok: True, trajectory, total_energy, reachable(masks),
+             pair_count, h_pairs, v_pairs, full_pair_count, fail_frame: None}
+    - 失败：{ok: False, fail_frame, pair_count: 0, reachable: None, ...}
+      失败路径不访问灰度数组，整轮灰度差计算量为 0。
+    """
+    n = len(grays)
+    H, W = grays[0].shape
+    base = full_pair_count(H, W, n)
+
+    masks, fail = reachable_masks(feasibles, locks)
+    if fail is not None:
+        return {
+            "ok": False, "fail_frame": int(fail),
+            "trajectory": None, "total_energy": None, "reachable": None,
+            "pair_count": 0, "h_pairs": 0, "v_pairs": 0,
+            "full_pair_count": base,
+        }
+
+    energies: list[np.ndarray] = []
+    h_total = v_total = 0
+    for i in range(n):
+        e, hp, vp = scored_window_energies(grays[i], masks[i])
+        energies.append(e)
+        h_total += hp
+        v_total += vp
+
+    traj, fail2, total = solve(energies, feasibles, locks)
+    if fail2 is not None:  # 理论不可达：可达掩码已保证存在完整轨迹
+        return {
+            "ok": False, "fail_frame": int(fail2),
+            "trajectory": None, "total_energy": None, "reachable": None,
+            "pair_count": 0, "h_pairs": 0, "v_pairs": 0,
+            "full_pair_count": base,
+        }
+    return {
+        "ok": True, "fail_frame": None,
+        "trajectory": traj, "total_energy": total, "reachable": masks,
+        "pair_count": h_total + v_total,
+        "h_pairs": h_total, "v_pairs": v_total,
+        "full_pair_count": base,
+    }
