@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>横拍转竖屏 9:16 裁切</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <h1>横拍手工课 → 竖屏 9:16 裁切</h1>
+
+  <section class="panel">
+    <div class="row">
+      <label>有序 PNG 帧（≤80，同尺寸）<input type="file" id="fileFrames" multiple accept="image/png"></label>
+      <label>逐帧必留框 JSON<input type="file" id="fileBoxes" accept=".json,application/json"></label>
+      <button id="btnUpload">上传</button>
+      <button id="btnSampleA">载入样片 A（可解）</button>
+      <button id="btnSampleB">载入样片 B（不可解演示）</button>
+      <button id="btnSolve" disabled>求解</button>
+    </div>
+    <div id="status" class="status"></div>
+  </section>
+
+  <section class="panel" id="viewer" hidden>
+    <div class="row nav">
+      <button id="btnPrev">← 上一帧</button>
+      <input type="range" id="slider" min="0" value="0">
+      <button id="btnNext">下一帧 →</button>
+      <span id="frameLabel"></span>
+      <button id="btnLock">锁定本帧位置</button>
+      <button id="btnUnlock">解锁本帧</button>
+    </div>
+    <div class="row">
+      <div class="pane">
+        <div class="pane-title">原图与裁切窗（可左右拖动）</div>
+        <canvas id="cvMain"></canvas>
+      </div>
+      <div class="pane" id="previewPane">
+        <div class="pane-title">竖屏预览（9:16）</div>
+        <canvas id="cvPreview"></canvas>
+      </div>
+    </div>
+    <div id="locks" class="locks"></div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
